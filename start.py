@@ -6,7 +6,7 @@ Usage:  python start.py
 Open:   http://localhost:8080/hf-watch.html
 """
 
-import os, sys, ssl, json, time, hashlib, sqlite3, urllib.request, urllib.parse
+import os, sys, ssl, json, time, hashlib, sqlite3, threading, urllib.request, urllib.parse
 from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
@@ -19,6 +19,12 @@ PORT = 8080
 # which persists across restarts but resets on redeploys.
 DB_PATH = os.environ.get('HFW_STATS_DB', os.path.join(os.getcwd(), 'hfwatch-stats.db'))
 
+# Historical total from before HFW_STATS_DB pointed at persistent storage —
+# added on top of the live DB count so the counter doesn't look like it
+# collapsed. Safe to leave in place permanently: once DB_PATH is durable this
+# is just a fixed baseline the real count keeps growing from.
+STATS_SEED = int(os.environ.get('HFW_STATS_SEED', '7200'))
+
 def _db():
     """Open a DB connection with WAL mode for safe concurrent access."""
     conn = sqlite3.connect(DB_PATH, timeout=10, check_same_thread=False)
@@ -30,22 +36,115 @@ def init_db():
         db.execute('''CREATE TABLE IF NOT EXISTS visits (
             id       INTEGER PRIMARY KEY AUTOINCREMENT,
             ip_hash  TEXT    NOT NULL,
-            ts       INTEGER NOT NULL
+            ts       INTEGER NOT NULL,
+            country  TEXT
         )''')
         db.execute('CREATE INDEX IF NOT EXISTS idx_visits_ts ON visits(ts)')
+        # Migrate DBs created before the country column existed.
+        cols = [r[1] for r in db.execute('PRAGMA table_info(visits)')]
+        if 'country' not in cols:
+            db.execute('ALTER TABLE visits ADD COLUMN country TEXT')
+
+        db.execute('''CREATE TABLE IF NOT EXISTS proxy_calls (
+            id       INTEGER PRIMARY KEY AUTOINCREMENT,
+            endpoint TEXT    NOT NULL,
+            ok       INTEGER NOT NULL,
+            ts       INTEGER NOT NULL
+        )''')
+        db.execute('CREATE INDEX IF NOT EXISTS idx_proxy_ts ON proxy_calls(ts)')
+
+        db.execute('''CREATE TABLE IF NOT EXISTS feature_events (
+            id       INTEGER PRIMARY KEY AUTOINCREMENT,
+            event    TEXT    NOT NULL,
+            detail   TEXT,
+            ts       INTEGER NOT NULL
+        )''')
+        db.execute('CREATE INDEX IF NOT EXISTS idx_feature_ts ON feature_events(ts)')
         db.commit()
     safe_print(f'  DB    stats → {DB_PATH}')
 
+# ── GeoIP (best-effort, country-level only) ───────────────────────────────────
+# Cached by ip_hash (not the raw IP) so a returning visitor costs one lookup
+# per day, not one per page load. The raw IP only ever exists in memory for
+# the duration of the outbound lookup request — it's never written to disk.
+_geoip_cache = {}   # ip_hash -> (country_code_or_None, looked_up_at)
+_GEOIP_TTL   = 86400
+
+def _is_private_ip(ip: str) -> bool:
+    if not ip or ip in ('127.0.0.1', '::1', 'localhost'):
+        return True
+    return ip.startswith(('10.', '192.168.', '169.254.')) or \
+           any(ip.startswith(f'172.{n}.') for n in range(16, 32))
+
+def geoip_lookup(ip: str, ip_hash: str):
+    """Return a 2-letter country code for ip, or None if it can't be resolved."""
+    if _is_private_ip(ip):
+        return None
+    cached = _geoip_cache.get(ip_hash)
+    if cached and time.time() - cached[1] < _GEOIP_TTL:
+        return cached[0]
+    cc = None
+    try:
+        req = urllib.request.Request(
+            f'http://ip-api.com/json/{urllib.parse.quote(ip)}?fields=countryCode',
+            headers={'User-Agent': 'HF-WATCH/2.0'}
+        )
+        with urllib.request.urlopen(req, timeout=4) as r:
+            cc = json.loads(r.read()).get('countryCode') or None
+    except Exception as e:
+        safe_print(f'  GeoIP ✗  {e}')
+    _geoip_cache[ip_hash] = (cc, time.time())
+    return cc
+
 def record_visit(ip: str):
-    """Log a page load. IP is one-way hashed — never stored in plain text."""
+    """Log a page load. IP is one-way hashed — never stored in plain text.
+    The country lookup is resolved in a background thread and back-filled
+    afterward, so a slow or unreachable geoip service never delays the
+    response — record_visit itself only ever does one fast local insert."""
     ip_hash = hashlib.sha256(ip.encode('utf-8')).hexdigest()[:20]
     ts      = int(time.time())
     try:
         with _db() as db:
-            db.execute('INSERT INTO visits (ip_hash, ts) VALUES (?,?)', (ip_hash, ts))
+            cur = db.execute('INSERT INTO visits (ip_hash, ts, country) VALUES (?,?,NULL)', (ip_hash, ts))
             db.commit()
+            row_id = cur.lastrowid
     except Exception as e:
         safe_print(f'  DB ✗  record_visit: {e}')
+        return
+    threading.Thread(target=_backfill_visit_country, args=(ip, ip_hash, row_id), daemon=True).start()
+
+def _backfill_visit_country(ip: str, ip_hash: str, row_id: int):
+    country = geoip_lookup(ip, ip_hash)
+    if not country:
+        return
+    try:
+        with _db() as db:
+            db.execute('UPDATE visits SET country=? WHERE id=?', (country, row_id))
+            db.commit()
+    except Exception as e:
+        safe_print(f'  DB ✗  _backfill_visit_country: {e}')
+
+def record_proxy_call(endpoint: str, ok: bool):
+    """Track each upstream fetch (DX cluster, HamQSL, OWM, QRZ) so failures
+    of an external source show up instead of silently degrading the display."""
+    try:
+        with _db() as db:
+            db.execute('INSERT INTO proxy_calls (endpoint, ok, ts) VALUES (?,?,?)',
+                       (endpoint, 1 if ok else 0, int(time.time())))
+            db.commit()
+    except Exception as e:
+        safe_print(f'  DB ✗  record_proxy_call: {e}')
+
+def record_feature_event(event: str, detail: str = ''):
+    """Log a client-reported UI interaction (map view opened, band filter
+    toggled, callsign looked up, ...) — see POST /track."""
+    try:
+        with _db() as db:
+            db.execute('INSERT INTO feature_events (event, detail, ts) VALUES (?,?,?)',
+                       ((event or '')[:40], (detail or '')[:80], int(time.time())))
+            db.commit()
+    except Exception as e:
+        safe_print(f'  DB ✗  record_feature_event: {e}')
 
 def get_stats() -> dict:
     """Return active unique visitors (last hour) and total all-time page loads."""
@@ -56,11 +155,59 @@ def get_stats() -> dict:
             active = db.execute(
                 'SELECT COUNT(DISTINCT ip_hash) FROM visits WHERE ts >= ?', (hour_ago,)
             ).fetchone()[0]
-            total = db.execute('SELECT COUNT(*) FROM visits').fetchone()[0]
+            total = db.execute('SELECT COUNT(*) FROM visits').fetchone()[0] + STATS_SEED
         return {'active': active, 'total': total}
     except Exception as e:
         safe_print(f'  DB ✗  get_stats: {e}')
         return {'active': 0, 'total': 0, 'error': str(e)}
+
+def get_analytics() -> dict:
+    """Fuller breakdown for the Settings → Analytics panel: 30-day traffic
+    trend, all-time hour-of-day distribution, upstream proxy health, top
+    client-reported feature events, and top visitor countries."""
+    since30 = int(time.time()) - 30*86400
+    try:
+        with _db() as db:
+            daily_rows = db.execute(
+                "SELECT date(ts,'unixepoch') d, COUNT(*) c FROM visits WHERE ts>=? GROUP BY d ORDER BY d",
+                (since30,)
+            ).fetchall()
+
+            hourly = [0]*24
+            for h, c in db.execute(
+                "SELECT CAST(strftime('%H',ts,'unixepoch') AS INTEGER) h, COUNT(*) c FROM visits GROUP BY h"
+            ).fetchall():
+                if h is not None:
+                    hourly[int(h)] = c
+
+            proxies = {}
+            for endpoint, ok, cnt, last_ts in db.execute(
+                'SELECT endpoint, ok, COUNT(*), MAX(ts) FROM proxy_calls GROUP BY endpoint, ok'
+            ).fetchall():
+                p = proxies.setdefault(endpoint, {'ok': 0, 'fail': 0, 'last_ok': None, 'last_fail': None})
+                if ok: p['ok'] = cnt;   p['last_ok']   = last_ts
+                else:  p['fail'] = cnt; p['last_fail'] = last_ts
+
+            features = db.execute(
+                "SELECT event, COALESCE(detail,'') d, COUNT(*) c FROM feature_events "
+                'GROUP BY event, d ORDER BY c DESC LIMIT 15'
+            ).fetchall()
+
+            countries = db.execute(
+                "SELECT country, COUNT(DISTINCT ip_hash) c FROM visits "
+                "WHERE country IS NOT NULL AND country<>'' GROUP BY country ORDER BY c DESC LIMIT 10"
+            ).fetchall()
+
+        return {
+            'daily':     [{'date': d, 'count': c} for d, c in daily_rows],
+            'hourly':    hourly,
+            'proxies':   proxies,
+            'features':  [{'event': e, 'detail': d, 'count': c} for e, d, c in features],
+            'countries': [{'country': cc, 'count': c} for cc, c in countries],
+        }
+    except Exception as e:
+        safe_print(f'  DB ✗  get_analytics: {e}')
+        return {'error': str(e)}
 
 ssl_ctx = ssl.create_default_context()
 
@@ -140,6 +287,13 @@ class Handler(SimpleHTTPRequestHandler):
         self.send_response(200)
         self._cors(); self.end_headers()
 
+    def _real_ip(self):
+        """Prefer X-Forwarded-For (set by Render's proxy) over the raw socket
+        address, which behind any reverse proxy is just the proxy itself —
+        not the visitor. Falls back to the socket address for local runs."""
+        xff = self.headers.get('X-Forwarded-For', '')
+        return xff.split(',')[0].strip() if xff else self.client_address[0]
+
     def do_GET(self):
         if self.path.startswith('/spots'):
             self._serve_dx()
@@ -149,22 +303,41 @@ class Handler(SimpleHTTPRequestHandler):
             self._proxy_hamqsl()
         elif self.path == '/stats':
             self._serve_stats()
+        elif self.path == '/analytics':
+            self._serve_analytics()
         else:
             # Record a visit whenever the main app page is loaded
             clean = self.path.split('?')[0].rstrip('/')
             if clean in ('', '/hf-watch.html', '/index.html'):
-                record_visit(self.client_address[0])
+                record_visit(self._real_ip())
             super().do_GET()
 
     def do_POST(self):
         if self.path == '/qrz-log':
             self._proxy_qrz_log()
+        elif self.path == '/track':
+            self._track_event()
         else:
             self.send_response(405)
             self.end_headers()
 
     def _serve_stats(self):
         self._json_response(get_stats())
+
+    def _serve_analytics(self):
+        self._json_response(get_analytics())
+
+    def _track_event(self):
+        """Client-reported UI interaction — see track() in index.html."""
+        try:
+            length = int(self.headers.get('Content-Length', 0))
+            body   = json.loads(self.rfile.read(length)) if length else {}
+            event  = str(body.get('event', '')).strip()
+            if event:
+                record_feature_event(event, str(body.get('detail', '')))
+        except Exception:
+            pass
+        self._json_response({'ok': True})
 
     def _proxy_qrz_log(self):
         """
@@ -204,6 +377,7 @@ class Handler(SimpleHTTPRequestHandler):
             result = parsed.get('RESULT', '').upper()
 
             if result == 'OK':
+                record_proxy_call('qrz', True)
                 self._json_response({
                     'result': 'OK',
                     'adif':   parsed.get('ADIF', ''),
@@ -213,10 +387,12 @@ class Handler(SimpleHTTPRequestHandler):
             else:
                 msg = parsed.get('REASON') or parsed.get('ERROR') or raw[:200]
                 safe_print(f'  QRZ ✗  {msg}')
+                record_proxy_call('qrz', False)
                 self._json_response({'error': msg, 'result': result})
 
         except Exception as e:
             safe_print(f'  QRZ !! {type(e).__name__}: {e}')
+            record_proxy_call('qrz', False)
             self._json_response({'error': f'{type(e).__name__}: {e}'})
 
     def _json_response(self, obj):
@@ -239,6 +415,7 @@ class Handler(SimpleHTTPRequestHandler):
             with urllib.request.urlopen(req, context=ssl_ctx, timeout=12) as r:
                 data = r.read()
                 ct = r.headers.get('Content-Type', 'text/xml')
+            record_proxy_call('hamqsl', True)
             self.send_response(200)
             self._cors()
             self.send_header('Content-Type', ct)
@@ -248,6 +425,7 @@ class Handler(SimpleHTTPRequestHandler):
             self.wfile.write(data)
         except Exception as e:
             safe_print(f'  HamQSL proxy error: {e}')
+            record_proxy_call('hamqsl', False)
             self.send_response(502)
             self.end_headers()
 
@@ -262,6 +440,7 @@ class Handler(SimpleHTTPRequestHandler):
             with urllib.request.urlopen(req, context=ssl_ctx, timeout=10) as r:
                 data = r.read()
                 ct = r.headers.get('Content-Type', 'image/png')
+            record_proxy_call('owm', True)
             self.send_response(200)
             self._cors()
             self.send_header('Content-Type', ct)
@@ -271,6 +450,7 @@ class Handler(SimpleHTTPRequestHandler):
             self.wfile.write(data)
         except Exception as e:
             safe_print(f'  OWM tile error: {e}')
+            record_proxy_call('owm', False)
             self.send_response(502)
             self.end_headers()
 
@@ -284,11 +464,14 @@ class Handler(SimpleHTTPRequestHandler):
             if spots:
                 safe_print(f'  DX ✓  {len(spots)} spots')
                 result = spots
+                record_proxy_call('dx', True)
             else:
                 result = {'error': f'0 spots parsed from {len(data)}b'}
+                record_proxy_call('dx', False)
         except Exception as e:
             safe_print(f'  DX ✗  {type(e).__name__}: {e}')
             result = {'error': f'{type(e).__name__}: {e}'}
+            record_proxy_call('dx', False)
 
         # Serialize — strip NaN coords and retry if needed
         try:

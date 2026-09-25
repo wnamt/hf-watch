@@ -155,7 +155,11 @@ header {
   display: flex; flex-direction: column; overflow-y: auto;
   background: var(--bg2); border-left: 1px solid var(--border-lit);
 }
-.sb-inner { padding: 14px 14px 52px; }
+/* Bottom padding clears the fixed #dev-credit (~38px) + #status-bar (~28px)
+   strip docked below this column. The old 52px left only ~5px of margin —
+   any slightly taller line (font substitution, more NOAA alerts, etc.) was
+   enough to tuck the last line under those fixed bars. */
+.sb-inner { padding: 14px 14px calc(84px + env(safe-area-inset-bottom, 0px)); }
 .sb-section { margin-bottom: 16px; }
 .sb-title {
   font-family: var(--font-ui); font-size: .49rem; letter-spacing: var(--ui-letter-spacing);
@@ -271,7 +275,8 @@ header {
   border: 1px solid var(--border-lit);
   box-shadow: 0 8px 48px rgba(0,0,0,.7), 0 0 30px rgba(255,170,0,.07);
   animation: panel-in .18s ease;
-  overflow: visible;
+  max-height: calc(100vh - 48px);
+  overflow-y: auto;
   display: grid;
   grid-template-columns: 1fr 1fr;
   grid-template-rows: auto 1fr;
@@ -281,9 +286,10 @@ header {
   to   { opacity: 1; transform: translate(-50%,-50%); }
 }
 
-/* Panel header */
+/* Panel header — sticky so the close button stays reachable once the panel scrolls */
 .sp-head {
   grid-column: 1 / -1;
+  position: sticky; top: 0; z-index: 2;
   display: flex; align-items: center; justify-content: space-between;
   padding: 12px 16px 10px;
   border-bottom: 1px solid var(--border-lit);
@@ -329,6 +335,23 @@ header {
 .sp-inline { display: flex; align-items: center; gap: 8px; }
 .sp-inline .sp-input { width: 72px; text-align: center; }
 .sp-unit { font-size: .54rem; color: var(--text-dim); letter-spacing: .06em; }
+
+/* Analytics — trend bars, reusing the kp-bars visual language */
+.an-bars { display: flex; gap: 2px; height: 40px; align-items: flex-end; }
+.an-bars .an-bar {
+  flex: 1; background: var(--amber-dim); opacity: .5; border-radius: 1px;
+  min-height: 2px; transition: height .4s, opacity .15s; cursor: default;
+}
+.an-bars .an-bar:hover { opacity: 1; }
+.an-empty { font-size: .54rem; color: var(--text-dim); }
+.an-cols { display: flex; gap: 22px; flex-wrap: wrap; margin-top: 4px; }
+.an-col { flex: 1; min-width: 170px; }
+.an-line {
+  display: flex; align-items: center; gap: 7px; font-size: .58rem;
+  color: var(--text-dim); padding: 3px 0; line-height: 1.3;
+}
+.an-line .an-val { margin-left: auto; color: var(--text); flex-shrink: 0; }
+.an-line .dot { flex-shrink: 0; }
 
 /* Theme swatches */
 .sp-themes { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 4px; }
@@ -1015,7 +1038,6 @@ body.panel-open .leaflet-control-zoom { display: none !important; }
   <div class="dot" id="dot"></div>
   <span id="status-msg">Initializing…</span>
   <div id="status-right">
-    <span id="last-update"></span>
     <span id="qth-badge"></span>
     <span id="visitor-stats"></span>
     <span>HF·WATCH</span>
@@ -1147,6 +1169,36 @@ body.panel-open .leaflet-control-zoom { display: none !important; }
       <div class="sp-row" id="sp-log-clear-row" style="display:none;">
         <div class="sp-lbl"></div>
         <button class="go-btn cs-clear-btn" id="sp-log-clear-btn" style="padding:5px 14px;">✕ Clear Log</button>
+      </div>
+    </div>
+
+    <!-- ANALYTICS -->
+    <div class="sp-section" style="grid-column:1/-1;">
+      <div class="sp-section-title">Analytics</div>
+
+      <div class="sp-row">
+        <div class="sp-lbl">Traffic — Last 30 Days</div>
+        <div class="an-bars" id="an-daily"><span class="an-empty">Loading…</span></div>
+      </div>
+
+      <div class="sp-row">
+        <div class="sp-lbl">Peak Hours (UTC)</div>
+        <div class="an-bars" id="an-hourly"><span class="an-empty">Loading…</span></div>
+      </div>
+
+      <div class="an-cols">
+        <div class="an-col">
+          <div class="sp-lbl">Upstream Health</div>
+          <div id="an-proxies"><span class="an-empty">Loading…</span></div>
+        </div>
+        <div class="an-col">
+          <div class="sp-lbl">Top Countries</div>
+          <div id="an-countries"><span class="an-empty">Loading…</span></div>
+        </div>
+        <div class="an-col">
+          <div class="sp-lbl">Feature Usage</div>
+          <div id="an-features"><span class="an-empty">Loading…</span></div>
+        </div>
       </div>
     </div>
 
@@ -1347,6 +1399,7 @@ let _activeMap='grid';
 
 function switchMap(id) {
   _activeMap = id;
+  track('view', id);
   document.querySelectorAll('.msel-btn').forEach(b => b.classList.toggle('active', b.dataset.map===id));
   document.querySelectorAll('.map-view').forEach(v => v.classList.remove('active'));
   document.getElementById('mv-'+id).classList.add('active');
@@ -1524,6 +1577,7 @@ function openSettings() {
   document.body.classList.add('panel-open');
   const focusEl = S.callsign ? 's-grid' : 's-call';
   setTimeout(() => document.getElementById(focusEl).focus(), 80);
+  loadAnalytics();
 }
 
 function commitSettings() {
@@ -1983,8 +2037,9 @@ function renderVHF(xml,noaa,kp){
       });
 
       // Aurora boundary latitude — prefer XML attribute, fall back to Kp formula
-      const aurLat = at['aurora|northern_hemi']?.lat
-        ? parseFloat(at['aurora|northern_hemi'].lat).toFixed(1)
+      // NB: HamQSL's phenomenon name is "vhf-aurora", not "aurora".
+      const aurLat = at['vhf-aurora|northern_hemi']?.lat
+        ? parseFloat(at['vhf-aurora|northern_hemi'].lat).toFixed(1)
         : Math.max(40, 66.5 - kp * 2.5).toFixed(1);
 
       // Solar flare probability from HamQSL XML
@@ -1993,14 +2048,35 @@ function renderVHF(xml,noaa,kp){
       // EME degradation derived from Kp (not in HamQSL VHF section)
       const emeVal = kp<=2?'Good':kp<=4?'Fair':'Poor';
 
+      // HamQSL doesn't always break Es out per-band/region — it may only
+      // publish a generic "europe"/"north_america" reading, or none at all.
+      // Prefer the band-specific reading, fall back to the region's generic
+      // reading, then to a seasonal estimate — so a row is never blank just
+      // because HamQSL happened not to publish that exact combination today.
+      const month=new Date().getUTCMonth()+1;
+      const es6Seasonal = (month>=5&&month<=8) ? 'Likely'
+                        : (month===4||month===9||month===10||month<=1||month>=12) ? 'Possible' : 'Unlikely';
+      const es4Seasonal = (month>=5&&month<=8) ? 'Possible' : 'Unlikely';
+      const es2Seasonal = (month>=6&&month<=7) ? 'Possible' : 'Unlikely';
+      const auroraSeasonal = kp>=5?'Active':kp>=3?'Possible':'Quiet';
+      let usedFallback = false;
+      const pick = (...vals) => {
+        for (const v of vals) if (v !== undefined) return v;
+      };
+      const live = (specific, generic, seasonal) => {
+        const v = pick(cm[specific], cm[generic]);
+        if (v === undefined) { usedFallback = true; return seasonal; }
+        return v;
+      };
+
       const rows = [
         vhfTextRow('Aur Lat', `${aurLat}°`, 'var(--text-primary)'),
-        cm['aurora|northern_hemi']           ? vhfCondRow('Aurora',    cm['aurora|northern_hemi'])        : '',
-        cm['E-Skip|europe_6m']               ? vhfCondRow('6m EsEU',   cm['E-Skip|europe_6m'])            : '',
-        cm['E-Skip|europe_4m']               ? vhfCondRow('4m EsEU',   cm['E-Skip|europe_4m'])            : '',
-        cm['E-Skip|europe_2m']               ? vhfCondRow('2m EsEU',   cm['E-Skip|europe_2m'])            : '',
-        cm['E-Skip|north_america_6m']        ? vhfCondRow('6m EsNA',   cm['E-Skip|north_america_6m'])     : '',
-        cm['E-Skip|north_america_2m']        ? vhfCondRow('2m EsNA',   cm['E-Skip|north_america_2m'])     : '',
+        vhfCondRow('Aurora',  live('vhf-aurora|northern_hemi', undefined,          auroraSeasonal)),
+        vhfCondRow('6m EsEU', live('E-Skip|europe_6m',         'E-Skip|europe',    es6Seasonal)),
+        vhfCondRow('4m EsEU', live('E-Skip|europe_4m',         'E-Skip|europe',    es4Seasonal)),
+        vhfCondRow('2m EsEU', live('E-Skip|europe_2m',         'E-Skip|europe',    es2Seasonal)),
+        vhfCondRow('6m EsNA', live('E-Skip|north_america_6m',  'E-Skip|north_america', es6Seasonal)),
+        vhfCondRow('2m EsNA', live('E-Skip|north_america_2m',  'E-Skip|north_america', es2Seasonal)),
         vhfCondRow('EME Deg', emeVal),
         flareProb ? vhfTextRow('Flare Prb', `${flareProb}%`,
           parseInt(flareProb)>=50?'var(--red)':parseInt(flareProb)>=20?'var(--yellow)':'var(--green)') : '',
@@ -2008,7 +2084,7 @@ function renderVHF(xml,noaa,kp){
 
       if(rows.length>=3){
         document.getElementById('vhf-tbody').innerHTML=rows.join('');
-        if(src){src.textContent='HamQSL';src.style.color='var(--green)';}
+        if(src){src.textContent=usedFallback?'HamQSL + est.':'HamQSL';src.style.color='var(--green)';}
         return;
       }
     }
@@ -2082,8 +2158,6 @@ async function fetchAll(){
   const ok=xml||kpRaw||plasma||noaaSolar;
   const srcs=[xml?'HamQSL':null,noaaSolar?'NOAA':null,kpRaw?'Kp':null].filter(Boolean);
   setStatus(ok?'ok':'stale',ok?`Live — ${srcs.join(' + ')} + SWPC`:'Sources unavailable');
-  const now=new Date();
-  document.getElementById('last-update').textContent=`Updated ${String(now.getUTCHours()).padStart(2,'0')}:${String(now.getUTCMinutes()).padStart(2,'0')} UTC`;
   scheduleRefresh();
 }
 function scheduleRefresh(){if(_refreshTimer)clearTimeout(_refreshTimer);_refreshTimer=setTimeout(fetchAll,S.refresh*60000);}
@@ -2120,7 +2194,7 @@ function initMap(){
   }
   if (!center) { center = [20, 15]; zoom = 2; }
 
-  const map=L.map('leaflet-map',{center,zoom,minZoom:1,worldCopyJump:true}); window._map=map;
+  const map=L.map('leaflet-map',{center,zoom,minZoom:1,worldCopyJump:true,zoomSnap:0.25,zoomDelta:0.25,wheelPxPerZoomLevel:90}); window._map=map;
   addBasemap(map, 13);
   drawGrid(map);
 
@@ -2194,6 +2268,7 @@ async function lookupCallsign(call) {
     setCsStatus('err', `${call} found but no coordinates`);
     return;
   }
+  track('callsign_lookup'); // count only — never log which callsign was searched
 
   // Build display name — clubs have name only, individuals have fname + name
   const name = [rec.fname, rec.name].filter(Boolean).join(' ').trim() || rec.call;
@@ -2295,6 +2370,30 @@ function drawGrid(map){
     }
     _gridLayers.fields=L.layerGroup(fl).addTo(map);
   }
+
+  // Sub-grid: 2°×1° Maidenhead squares, one field subdivided into 10×10.
+  // Only worth drawing once zoomed in past field-level (else it's thousands
+  // of sub-pixel lines); labels wait for an even closer zoom to avoid a wall
+  // of text at the point squares first become visible.
+  const zoom = map.getZoom();
+  if(showF && zoom>=5){
+    const sl=[];
+    const lonMin=Math.floor(bb.getWest()/2)*2-2, lonMax=Math.ceil(bb.getEast()/2)*2+2;
+    const latMin=Math.max(-90,Math.floor(bb.getSouth())-1), latMax=Math.min(90,Math.ceil(bb.getNorth())+1);
+    for(let lon=lonMin;lon<=lonMax;lon+=2) sl.push(L.polyline([[latMin,lon],[latMax,lon]],{color:cLine,weight:1,opacity:.16}));
+    for(let lat=latMin;lat<=latMax;lat+=1) sl.push(L.polyline([[lat,lonMin],[lat,lonMax]],{color:cLine,weight:1,opacity:.16}));
+    if(showL && zoom>=7){
+      const cFontUI = themeColor('--font-ui');
+      for(let lon=lonMin;lon<lonMax;lon+=2) for(let lat=latMin;lat<latMax;lat+=1){
+        const clat=lat+.5, clon=lon+1;
+        if(bb.contains([clat,clon])){
+          const sq=latLngToGrid(clat,clon,4).slice(2);
+          sl.push(L.marker([clat,clon],{icon:L.divIcon({html:`<div style="font-family:${cFontUI};font-size:9px;color:${cLabel};opacity:0.6;font-weight:600;pointer-events:none;transform:translate(-50%,-50%)">${sq}</div>`,iconSize:[0,0],className:''})}));
+        }
+      }
+    }
+    _gridLayers.squares=L.layerGroup(sl).addTo(map);
+  }
 }
 function goToGrid(g,animate=true,moveMap=true){
   const map=window._map; if(!map)return;
@@ -2323,13 +2422,41 @@ function goToGrid(g,animate=true,moveMap=true){
 // ══════════════════════════════════════════
 function getSunPosition(now){const n=(now.getTime()-Date.UTC(2000,0,1,12))/86400000,L=(280.460+0.9856474*n)%360,g=((357.528+0.9856003*n)%360)*Math.PI/180,lam=(L+1.915*Math.sin(g)+0.020*Math.sin(2*g))*Math.PI/180,eps=(23.439-0.0000004*n)*Math.PI/180,dec=Math.asin(Math.sin(eps)*Math.sin(lam)),ra=Math.atan2(Math.cos(eps)*Math.sin(lam),Math.cos(lam)),gmst=((280.46061837+360.98564736629*n)%360+360)%360,gha=gmst-ra*180/Math.PI,lon=((-gha%360)+360+180)%360-180;return{lat:dec*180/Math.PI,lon};}
 function computeTerminator(sunLat,sunLon){
-  const slr=sunLat*Math.PI/180, pts=[];
-  for(let ti=0;ti<=360;ti++){
-    const th=ti*Math.PI/180;
-    const latR=Math.asin(Math.cos(slr)*Math.cos(th));
-    const lonDeg=sunLon+Math.atan2(Math.sin(th)*Math.cos(slr),-Math.sin(slr)*Math.sin(latR))*180/Math.PI;
-    pts.push([latR*180/Math.PI, lonDeg]);
+  // Built from the subsolar point's unit vector + an orthonormal basis of the
+  // plane perpendicular to it, walked at a constant angular step around the
+  // 3D great circle (this avoids the old atan2(sin(th)*dec, -dec*sin(latR))
+  // formula, whose args both shrink toward zero at th≈0/180° when dec≈0).
+  //
+  // Near the equinoxes the terminator passes within a fraction of a degree of
+  // both poles, and Mercator longitude compresses arc-length badly up there
+  // (dLon ≈ dArc / cos(lat)) — so a fixed 1°-of-arc step, fine everywhere
+  // else, turns into a 40-90° longitude jump right at the pole crossing.
+  // Leaflet still has to draw a straight chord between those two samples,
+  // which is what reads as the greyline "squaring off" near the poles at the
+  // equinoxes. Fix: shrink the step adaptively as cos(lat)→0 so the drawn
+  // longitude delta stays capped everywhere, seasons included.
+  const slr=sunLat*Math.PI/180, slo=sunLon*Math.PI/180;
+  const Sx=Math.cos(slr)*Math.cos(slo), Sy=Math.cos(slr)*Math.sin(slo), Sz=Math.sin(slr);
+  // U = north-pole axis (0,0,1) × S, normalized — spans the plane ⟂ S
+  let Ux=-Sy, Uy=Sx, Uz=0;
+  const Ulen=Math.hypot(Ux,Uy,Uz) || 1;
+  Ux/=Ulen; Uy/=Ulen; Uz/=Ulen;
+  // V completes the right-handed basis: V = S × U
+  const Vx=Sy*Uz-Sz*Uy, Vy=Sz*Ux-Sx*Uz, Vz=Sx*Uy-Sy*Ux;
+  const pointAt=(thDeg)=>{
+    const th=thDeg*Math.PI/180, c=Math.cos(th), s=Math.sin(th);
+    const x=c*Ux+s*Vx, y=c*Uy+s*Vy, z=c*Uz+s*Vz;
+    return [Math.asin(z)*180/Math.PI, Math.atan2(y,x)*180/Math.PI];
+  };
+
+  const MAX_LON_STEP = 1; // ° — cap on longitude change between consecutive samples
+  const pts=[]; let thDeg=0;
+  while(thDeg<360-1e-9){
+    const p=pointAt(thDeg); pts.push(p);
+    const cosLat=Math.max(1e-5, Math.abs(Math.cos(p[0]*Math.PI/180)));
+    thDeg=Math.min(360, thDeg + Math.max(0.002, Math.min(1, MAX_LON_STEP*cosLat)));
   }
+  pts.push(pointAt(360));
   // Make consecutive longitudes continuous — eliminates the wrap-around horizontal line
   for(let i=1;i<pts.length;i++){
     while(pts[i][1]-pts[i-1][1]> 180) pts[i][1]-=360;
@@ -2516,7 +2643,7 @@ function addBasemap(map, maxZoom){
 async function initWeatherMap(){
   if(_wxInited)return; _wxInited=true;
   const center = S.grid ? gridToLatLng(S.grid) : [48,-116];
-  _wxMap = L.map('wx-map', {center, zoom:5, minZoom:1});
+  _wxMap = L.map('wx-map', {center, zoom:5, minZoom:1, zoomSnap:0.25, zoomDelta:0.25, wheelPxPerZoomLevel:90});
   addBasemap(_wxMap, 16);
 
   document.querySelectorAll('.wx-mode-btn').forEach(btn => {
@@ -2808,6 +2935,7 @@ function dxInitPanel() {
       btn.classList.toggle('on', _dxBandsOn.has(band));
       dxSaveBandPrefs(_dxBandsOn);
       dxApplyBandVisibility();
+      track('band_filter', band);
     });
     row.appendChild(btn);
   });
@@ -3489,6 +3617,77 @@ setInterval(() => {
   fetchStats();
   setInterval(fetchStats, 5 * 60 * 1000); // refresh every 5 minutes
 })();
+
+// ══════════════════════════════════════════
+// FEATURE TRACKING  (fire-and-forget → POST /track)
+// ══════════════════════════════════════════
+function track(event, detail) {
+  try {
+    fetch('/track', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ event, detail: detail || '' }),
+      keepalive: true,
+    }).catch(() => {});
+  } catch (e) {}
+}
+
+// ══════════════════════════════════════════
+// ANALYTICS PANEL  (Settings → Analytics, loaded on open)
+// ══════════════════════════════════════════
+function flagEmoji(cc) {
+  if (!cc || cc.length !== 2) return '';
+  return String.fromCodePoint(...[...cc.toUpperCase()].map(c => 127397 + c.charCodeAt(0)));
+}
+
+const PROXY_LABELS = { dx: 'DX Cluster', hamqsl: 'HamQSL Solar', owm: 'OWM Weather', qrz: 'QRZ Logbook' };
+
+async function loadAnalytics() {
+  const data = await safeFetch('/analytics');
+  const dailyEl     = document.getElementById('an-daily');
+  const hourlyEl    = document.getElementById('an-hourly');
+  const proxiesEl   = document.getElementById('an-proxies');
+  const countriesEl = document.getElementById('an-countries');
+  const featuresEl  = document.getElementById('an-features');
+  if (!data || data.error) {
+    const msg = '<span class="an-empty">Unavailable</span>';
+    dailyEl.innerHTML = hourlyEl.innerHTML = proxiesEl.innerHTML = countriesEl.innerHTML = featuresEl.innerHTML = msg;
+    return;
+  }
+
+  // Traffic trend — one bar per day, last 30 days
+  const maxDaily = Math.max(1, ...data.daily.map(d => d.count));
+  dailyEl.innerHTML = data.daily.length
+    ? data.daily.map(d => `<div class="an-bar" style="height:${Math.max(6, d.count / maxDaily * 100)}%" title="${d.date}: ${d.count} visit${d.count===1?'':'s'}"></div>`).join('')
+    : '<span class="an-empty">No visits yet</span>';
+
+  // Peak hours — 24 bars, UTC hour-of-day, all-time
+  const maxHourly = Math.max(1, ...data.hourly);
+  hourlyEl.innerHTML = data.hourly.map((c, h) =>
+    `<div class="an-bar" style="height:${Math.max(6, c / maxHourly * 100)}%" title="${String(h).padStart(2,'0')}:00 UTC — ${c} visit${c===1?'':'s'}"></div>`
+  ).join('');
+
+  // Upstream proxy health
+  const proxRows = Object.entries(PROXY_LABELS).map(([key, label]) => {
+    const p = data.proxies[key];
+    if (!p) return `<div class="an-line"><span class="dot err" style="animation:none;background:var(--border);box-shadow:none;"></span>${label}<span class="an-val">no data</span></div>`;
+    const total = p.ok + p.fail;
+    const pct = total ? Math.round(p.ok / total * 100) : 0;
+    const cls = pct >= 95 ? '' : pct >= 80 ? 'stale' : 'err';
+    return `<div class="an-line"><span class="dot ${cls}" style="animation:none;"></span>${label}<span class="an-val">${pct}% (${p.ok}/${total})</span></div>`;
+  });
+  proxiesEl.innerHTML = proxRows.join('');
+
+  // Top countries
+  countriesEl.innerHTML = data.countries.length
+    ? data.countries.map(c => `<div class="an-line">${flagEmoji(c.country)} ${c.country}<span class="an-val">${c.count}</span></div>`).join('')
+    : '<span class="an-empty">No data yet</span>';
+
+  // Feature usage
+  featuresEl.innerHTML = data.features.length
+    ? data.features.map(f => `<div class="an-line">${f.event}${f.detail ? ': ' + f.detail : ''}<span class="an-val">${f.count}</span></div>`).join('')
+    : '<span class="an-empty">No data yet</span>';
+}
 </script>
 </body>
 </html>

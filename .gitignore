@@ -1,0 +1,5 @@
+hfwatch-stats.db
+hfwatch-stats.db-shm
+hfwatch-stats.db-wal
+__pycache__/
+.claude/

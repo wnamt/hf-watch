@@ -243,7 +243,8 @@ header {
 .dot.stale { background: var(--yellow); box-shadow: 0 0 7px var(--yellow); }
 .dot.err   { background: var(--red);    box-shadow: 0 0 7px var(--red);    animation: none; }
 @keyframes blink { 0%,100%{opacity:1} 50%{opacity:.3} }
-#status-right { margin-left: auto; display: flex; gap: 16px; }
+#status-right { margin-left: auto; display: flex; gap: 16px; flex-shrink: 0; white-space: nowrap; }
+#status-msg { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 #qth-badge { font-family: var(--font-ui); font-size: .5rem; color: var(--amber-dim); letter-spacing: .1em; }
 #visitor-stats {
   font-family: var(--font-ui); font-size: .5rem; color: var(--text-dim);
@@ -405,6 +406,7 @@ header {
   color: var(--text-dim); padding: 4px 8px; cursor: pointer;
   outline: none; appearance: none; -webkit-appearance: none;
   white-space: nowrap; flex-shrink: 0;
+  min-width: 7.5em; text-align: center; text-align-last: center;  /* room for letter-spacing */
 }
 #dx-mode-filter:hover { border-color: var(--amber-dim); color: var(--amber); }
 #dx-mode-filter option { background: var(--bg2); color: var(--text); }
@@ -476,6 +478,7 @@ body.panel-open .leaflet-control-zoom { display: none !important; }
 /* ── MAP BACKGROUNDS — kill white polar regions ── */
 .leaflet-container { background: var(--bg-solid) !important; }
 .map-views, #map-wrap, #wx-wrap { background: var(--bg-solid); }
+.osm-dark { filter: invert(1) hue-rotate(180deg) brightness(0.8) contrast(0.9) saturate(0.4); }
 
 /* ════════════════════════════════════════════
    MOBILE / RESPONSIVE LAYOUT
@@ -1001,8 +1004,8 @@ body.panel-open .leaflet-control-zoom { display: none !important; }
 
   </div><!-- /solar-sidebar -->
 
-  <div id="dev-credit" style="position:fixed;bottom:24px;right:0;width:22%;min-width:240px;max-width:380px;text-align:right;padding:3px 14px;border-top:1px solid var(--border);background:var(--bg2);z-index:49;">
-    <span style="font-family:'DM Mono',monospace;font-size:.52rem;color:var(--text-dim);letter-spacing:.14em;">Developed by WNAMT utilizing Claude</span>
+  <div id="dev-credit" style="position:fixed;bottom:24px;right:0;width:22%;min-width:240px;max-width:380px;box-sizing:border-box;text-align:right;padding:3px 14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;border-top:1px solid var(--border);background:var(--bg2);z-index:49;">
+    <span style="font-family:'DM Mono',monospace;font-size:.52rem;color:var(--text-dim);letter-spacing:.06em;">Developed by WNAMT utilizing Claude</span>
   </div>
 
 </div><!-- /main-layout -->
@@ -1747,6 +1750,31 @@ function renderAIndex(xml,noaa){
   const el=document.getElementById('aindex-lbl');
   el.textContent=v<=7?'Quiet':v<=15?'Unsettled':v<=29?'Active':v<=49?'Minor Storm':'Major Storm'; el.style.color=c;
 }
+// NOAA retired products/solar-wind/*-7-day.json (404 as of 2026). The
+// real-time solar wind (RTSW) feeds replace them: newest-first objects from
+// several spacecraft (ACE, IMAP, SOLAR1…), with the operational one "active".
+// Returns rows shaped like the old array-of-arrays products so
+// renderSolarWind() works with either source.
+async function fetchSolarWind(kind){
+  const rtsw = await safeFetch(`${NOAA}/json/rtsw/rtsw_${kind}_1m.json`);
+  const field = kind==='wind' ? 'proton_speed' : 'bz_gsm';
+  if (Array.isArray(rtsw) && rtsw.length) {
+    const ok = rtsw.filter(r => r && r[field]!=null && !isNaN(parseFloat(r[field])))
+                   .sort((a,b) => (b.time_tag||'').localeCompare(a.time_tag||''));
+    if (ok.length) {
+      // Prefer the active spacecraft if it reported within 30 min of the newest row
+      const newest = Date.parse(ok[0].time_tag+'Z');
+      const act = ok.find(r => r.active && newest - Date.parse(r.time_tag+'Z') <= 30*60e3);
+      const r = act || ok[0];
+      return kind==='wind'
+        ? [['time_tag','density','speed','temperature'], [r.time_tag, r.proton_density, r.proton_speed, r.proton_temperature]]
+        : [['time_tag','bx_gsm','by_gsm','bz_gsm','lon_gsm','lat_gsm','bt'], [r.time_tag, r.bx_gsm, r.by_gsm, r.bz_gsm, r.phi_gsm, r.theta_gsm, r.bt]];
+    }
+  }
+  // Fallback: legacy product, in case it comes back
+  return safeFetch(`${NOAA}/products/solar-wind/${kind==='wind'?'plasma':'mag'}-7-day.json`);
+}
+
 function renderSolarWind(plasma,mag){
   if(plasma&&plasma.length>1){const last=plasma[plasma.length-1];const idx=Array.isArray(plasma[0])?plasma[0].indexOf('speed'):2;const speed=parseFloat(last[idx>=0?idx:2]);if(!isNaN(speed)){const c=speed>600?'var(--red)':speed>450?'var(--yellow)':'var(--green)';setBig('sw-speed',Math.round(speed),c);}}else document.getElementById('sw-speed').textContent='N/A';
   if(mag&&mag.length>1){const last=mag[mag.length-1];const bzIdx=Array.isArray(mag[0])?mag[0].indexOf('bz_gsm'):3;const btIdx=Array.isArray(mag[0])?mag[0].indexOf('bt'):6;const bz=parseFloat(last[bzIdx>=0?bzIdx:3]);const bt=parseFloat(last[btIdx>=0?btIdx:6]);if(!isNaN(bz)){const bzColor=bz<-5?'var(--red)':bz<0?'var(--yellow)':'var(--green)';document.getElementById('sw-bz').innerHTML=`<span style="color:${bzColor}">${bz>=0?`Bz +${bz.toFixed(1)}`:`Bz ${bz.toFixed(1)}`} nT${!isNaN(bt)?` | Bt ${bt.toFixed(1)}`:''}`;}}
@@ -2031,7 +2059,7 @@ async function fetchAll(){
   setStatus('loading','Fetching space weather…');
   const [xml,kpRaw,plasma,mag,xray,alerts,noaaSolar]=await Promise.all([
     safeFetch(HAMQSL,'xml'), safeFetch(`${NOAA}/products/noaa-planetary-k-index.json`),
-    safeFetch(`${NOAA}/products/solar-wind/plasma-7-day.json`), safeFetch(`${NOAA}/products/solar-wind/mag-7-day.json`),
+    fetchSolarWind('wind'), fetchSolarWind('mag'),
     safeFetch(`${NOAA}/json/goes/primary/xrays-1-day.json`), safeFetch(`${NOAA}/products/alerts.json`),
     fetchNoaaDailySolar(),
   ]);
@@ -2093,7 +2121,7 @@ function initMap(){
   if (!center) { center = [20, 15]; zoom = 2; }
 
   const map=L.map('leaflet-map',{center,zoom,minZoom:1,worldCopyJump:true}); window._map=map;
-  L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',{attribution:'© OpenStreetMap contributors © CARTO',subdomains:'abcd',maxZoom:13}).addTo(map);
+  addBasemap(map, 13);
   drawGrid(map);
 
   // Save map view whenever it changes
@@ -2456,13 +2484,40 @@ const WX_MODES = {
   precip: { label: 'OWM Precipitation',  type: 'owm', layer: 'precipitation_new',opacity: 0.75 },
 };
 
+// ── BASEMAP ────────────────────────────────────────────────────────────────
+// CARTO now watermarks keyless tiles ("API KEY REQUIRED"), so use Esri's
+// keyless dark gray canvas (base + labels). If Esri tiles keep failing,
+// fall back to standard OpenStreetMap tiles darkened with a CSS filter.
+function addBasemap(map, maxZoom){
+  const ESRI = 'https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/';
+  const opts = {maxZoom, maxNativeZoom:16};
+  const base = L.tileLayer(ESRI+'World_Dark_Gray_Base/MapServer/tile/{z}/{y}/{x}',
+    {...opts, attribution:'Tiles © Esri — Esri, HERE, Garmin, © OpenStreetMap contributors'}).addTo(map);
+  if (!map.getPane('labels')) {
+    const p = map.createPane('labels');
+    p.style.zIndex = 350;            // above tiles/radar, below DX lines & markers
+    p.style.pointerEvents = 'none';
+  }
+  const labels = L.tileLayer(ESRI+'World_Dark_Gray_Reference/MapServer/tile/{z}/{y}/{x}',
+    {...opts, pane:'labels', opacity:0.8}).addTo(map);
+
+  let errors = 0, switched = false;
+  base.on('tileerror', () => {
+    if (switched || ++errors < 6) return;
+    switched = true;
+    map.removeLayer(base); map.removeLayer(labels);
+    L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+      {maxZoom, maxNativeZoom:19, className:'osm-dark',
+       attribution:'© OpenStreetMap contributors'}).addTo(map);
+    console.warn('HF-WATCH: Esri basemap unavailable, using OpenStreetMap');
+  });
+}
+
 async function initWeatherMap(){
   if(_wxInited)return; _wxInited=true;
   const center = S.grid ? gridToLatLng(S.grid) : [48,-116];
   _wxMap = L.map('wx-map', {center, zoom:5, minZoom:1});
-  L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',
-    {attribution:'© OpenStreetMap contributors © CARTO', subdomains:'abcd', maxZoom:19}
-  ).addTo(_wxMap);
+  addBasemap(_wxMap, 16);
 
   document.querySelectorAll('.wx-mode-btn').forEach(btn => {
     btn.addEventListener('click', () => {

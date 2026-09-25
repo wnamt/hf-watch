@@ -803,7 +803,7 @@ body.panel-open .leaflet-control-zoom { display: none !important; }
 <!-- HEADER -->
 <header>
   <div style="display:flex;flex-direction:column;gap:2px;padding-right:24px;border-right:1px solid var(--border-lit);flex-shrink:0;">
-    <div class="logo" style="border-right:none;padding-right:0;">HF·WATCH<sup>v0.7.51</sup></div>
+    <div class="logo" style="border-right:none;padding-right:0;">HF·WATCH<sup>v0.8.1</sup></div>
     <div class="header-dev-warning" style="font-family:'DM Mono',monospace;font-size:.3rem;color:#cc2222;letter-spacing:.1em;line-height:1;">UNDER DEVELOPMENT · SUBJECT TO CHANGE</div>
   </div>
   <div id="hdr-callsign" class="empty">⚙ SET CALLSIGN</div>
@@ -1217,6 +1217,33 @@ body.panel-open .leaflet-control-zoom { display: none !important; }
 //   MINOR — new features, backward compatible
 //   PATCH — bug fixes, tweaks, minor adjustments
 //
+// v0.8.1 (2026-09-25)
+//   - Fix: greyline "squared off" near the poles at the equinoxes. computeTerminator()
+//     stepped in fixed 1° increments; Mercator longitude compression near the poles
+//     turned that into 40-90° jumps drawn as straight chords right where the curve
+//     should taper smoothly. Now steps adaptively so the drawn longitude delta stays
+//     capped at ~1° everywhere, poles included.
+//   - Fix: map zoom jumped a full level per scroll/click. zoomSnap/zoomDelta set to
+//     0.25 on both Leaflet maps for finer zoom resolution.
+//   - New: sub-grid squares (2°x1° Maidenhead) now draw when zoomed in — the
+//     '_gridLayers.squares' slot existed but was never populated.
+//   - Fix: settings panel and sidebar bottom padding relied on a few px of
+//     coincidental margin to clear fixed UI chrome (dev credit, status bar) —
+//     replaced with a real safety margin; settings panel also gained overflow
+//     scroll + a sticky header since it could run off-screen on shorter displays.
+//   - Fix: removed redundant "Updated HH:MM UTC" from the status bar (duplicated
+//     the header clock).
+//   - Fix: renderVHF() looked up phenomenon key "aurora" but HamQSL's XML names it
+//     "vhf-aurora" — silently hid a real, available Aurora row. Added a
+//     band-specific → regional → seasonal fallback chain so rows no longer vanish
+//     just because HamQSL omitted one specific band/region combination.
+//   - Fix: visitor total reset on every redeploy (Render's ephemeral filesystem).
+//     Added HFW_STATS_DB support for a persistent disk, a seeded baseline
+//     (STATS_SEED) so history isn't lost, and real client IP via X-Forwarded-For
+//     instead of the proxy's own address.
+//   - New: Settings → Analytics — 30-day traffic trend, hour-of-day distribution,
+//     upstream proxy health (DX/HamQSL/OWM/QRZ), feature usage, visitor countries.
+//     GeoIP resolved in a background thread so a slow lookup never delays the page.
 // v0.7.51 (2026-04-24)
 //   - Fix: DX band buttons restored to correct position (between DX/filter and LOG).
 //     Root cause: v0.7.49 moved #dx-band-row outside #toolbar-main; the margin-left:auto
@@ -1352,7 +1379,7 @@ body.panel-open .leaflet-control-zoom { display: none !important; }
 //   - DX spot count increased to 50 rendered; server requests 100 for filter headroom
 // ══════════════════════════════════════════
 
-const APP_VERSION = '0.7.51';
+const APP_VERSION = '0.8.1';
 // ══════════════════════════════════════════
 // STATE
 // ══════════════════════════════════════════
